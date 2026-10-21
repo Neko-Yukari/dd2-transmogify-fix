@@ -1,0 +1,346 @@
+diff --git a/vanilla/Transmogify.lua b/reframework/autorun/Transmogify.lua
+index 4e76457..52987b0 100644
+--- a/vanilla/Transmogify.lua
++++ b/reframework/autorun/Transmogify.lua
+@@ -3955,10 +3955,108 @@ local function LoadWeaponPrefabPaths(catalog_dic)
+     coroutine.yield()
+   end
+   Transmogify.init_prefab_loader, Transmogify.init_waiting_prefab = nil, nil
+-  return paths
++  return paths, loader.failed
++end
++
++-- Weapon path cache ---------------------------------------------------------------------------------------------
++-- Mesh and material paths can only be read by instantiating a prefab and waiting for its mesh and material to be
++-- ready, which costs seconds per hundred weapons. The results are cached in
++-- reframework/data/Transmogify/weapon_paths_cache.json so later launches only prepare new or changed prefabs.
++-- Validation: the game executable size, each prefab's own resource path, and a small sample of cached entries that
++-- is re-read on every launch, which catches a resource layout change the fingerprints cannot see.
++local weapon_cache_path = "Transmogify/weapon_paths_cache.json"
++local WEAPON_CACHE_SCHEMA = 1
++local WEAPON_CACHE_SAMPLE = 8
++local WEAPON_CACHE_MAX_FAILURES = 3
++
++local function ReadTextFile(path, limit)
++  local ok, file = pcall(io.open, path, "rb")
++  if not ok or not file then return nil end
++  local read_ok, content = pcall(file.read, file, limit or 256)
++  file:close()
++  if not read_ok then return nil end
++  return content
++end
++
++local function GetWeaponCacheBuild()
++  -- REFramework blocks Lua from touching executables and DLLs ("This API does not allow interacting with executables
++  -- or DLLs"), so fingerprint the REFramework revision instead. The per-prefab resource paths plus the sampled
++  -- re-reads are what actually catch a changed weapon layout.
++  local revision = ReadTextFile("reframework_revision.txt", 128)
++  if type(revision) == "string" then
++    return (revision:gsub("%s+", "")):sub(1, 24)
++  end
++  return "unknown"
++end
++
++-- The prefab controller's resource path, readable without instantiating anything.
++local function GetPrefabResourcePath(prefab_controller)
++  local controller = prefab_controller and prefab_controller ~= utils.NATIVE_NULL and prefab_controller._Item
++  if not controller then return nil end
++  local path = controller:get_ResourcePath()
++  if path == nil or path == "" then return nil end
++  return path
++end
++
++local function LoadWeaponCache(build)
++  local ok, data = pcall(json.load_file, weapon_cache_path)
++  if not ok or type(data) ~= "table" or data.schema ~= WEAPON_CACHE_SCHEMA or data.build ~= build
++    or type(data.entries) ~= "table" then
++    return nil
++  end
++  local count = 0
++  for _ in pairs(data.entries) do count = count + 1 end
++  utils.Log(string.format("[%s] Weapon path cache hit for %d prefabs (build %s)", modname, count, build))
++  return data.entries
++end
++
++local function SaveWeaponCache(build, entries)
++  local count = 0
++  for _ in pairs(entries) do count = count + 1 end
++  local ok, saved = pcall(json.dump_file, weapon_cache_path,
++    {schema = WEAPON_CACHE_SCHEMA, build = build, entries = entries})
++  if not ok or not saved then
++    utils.Log("[" .. modname .. "] Could not save the weapon path cache; the next launch prepares everything again")
++    return
++  end
++  utils.Log(string.format("[%s] Weapon path cache saved for %d prefabs (build %s)", modname, count, build))
++end
++
++-- Re-reads a few cached prefabs and reports how many no longer match their cached paths.
++local function VerifyWeaponCacheSample(cache, catalog)
++  local ids = {}
++  for weapon_id, entry in pairs(cache) do
++    if entry.kind == "ok" and catalog[weapon_id] ~= nil then ids[#ids + 1] = weapon_id end
++  end
++  if #ids == 0 then return 0 end
++  table.sort(ids)
++  local sample, sample_dic, seen = {}, {}, {}
++  local stride = math.max(1, math.floor(#ids / WEAPON_CACHE_SAMPLE))
++  for index = 1, #ids, stride do
++    local weapon_id = ids[index]
++    if not seen[weapon_id] then
++      seen[weapon_id] = true
++      sample[#sample + 1] = weapon_id
++      sample_dic[weapon_id] = catalog[weapon_id]
++    end
++    if #sample >= WEAPON_CACHE_SAMPLE then break end
++  end
++  local verified = LoadWeaponPrefabPaths(sample_dic)
++  local mismatches = 0
++  for _, weapon_id in ipairs(sample) do
++    local fresh, cached = verified[weapon_id], cache[weapon_id]
++    if fresh == nil or fresh.mesh_path ~= cached.mesh or fresh.mat_path ~= cached.mat then
++      mismatches = mismatches + 1
++    end
++  end
++  if mismatches > 0 then
++    utils.Log(string.format("[%s] Weapon path cache: %d of %d sampled prefabs changed", modname, mismatches, #sample))
++  end
++  return mismatches
+ end
+ 
+ local function AddWeapons()
++  utils.Log("[" .. modname .. "] Building the weapon catalog")
+   local wp_to_job = {
+     ["wp00"] = EQUIP_JOB_FIGHTER,
+     ["wp01"] = EQUIP_JOB_FIGHTER,
+@@ -3978,14 +4076,65 @@ local function AddWeapons()
+   end
+ 
+   local EquipmentManager = sdk.get_managed_singleton('app.EquipmentManager')
++  local catalog = utils.GetLuaDic(EquipmentManager.WeaponCatalog)
++
++  -- The weapon catalog stays empty until the game has loaded its item data. Building from an empty catalog used to
++  -- crash on the final table.sort and leave the mod stuck on its initial status forever, so wait for it instead.
++  local catalog_wait = 0
++  while next(catalog) == nil do
++    catalog_wait = catalog_wait + 1
++    Transmogify.init_status = "Waiting for the weapon catalog"
++    if catalog_wait % 600 == 0 then
++      utils.Log("[" .. modname .. "] Still waiting for the weapon catalog to load")
++    end
++    coroutine.yield()
++    catalog = utils.GetLuaDic(EquipmentManager.WeaponCatalog)
++  end
++  local cache_build, cached_paths = "unknown", {}
++
++  -- The cache is an optimisation only: if anything about it fails, fall back to the plain full build.
++  local bootstrap_ok, bootstrap_error = pcall(function()
++    cache_build = GetWeaponCacheBuild()
++    cached_paths = LoadWeaponCache(cache_build) or {}
++    if VerifyWeaponCacheSample(cached_paths, catalog) >= 2 then
++      utils.Log("[" .. modname .. "] Weapon path cache looks stale; rebuilding every weapon appearance")
++      cached_paths = {}
++      Transmogify.catalog_weapons = {}
++    end
++  end)
++  if not bootstrap_ok then
++    utils.Log("[" .. modname .. "] Weapon path cache unavailable this run: " .. tostring(bootstrap_error))
++    cached_paths = {}
++  end
+ 
+   local prefab_paths = Transmogify.catalog_weapons
+-  local new_weapons, new_count = {}, 0
+-  for weapon_id, prefab_controller in pairs(utils.GetLuaDic(EquipmentManager.WeaponCatalog)) do
+-    if prefab_paths[weapon_id] == nil then new_weapons[weapon_id], new_count = prefab_controller, new_count + 1 end
++  local new_weapons, new_count, reused_count = {}, 0, 0
++  for weapon_id, prefab_controller in pairs(catalog) do
++    if prefab_paths[weapon_id] ~= nil then
++      -- Prepared earlier in this session by UpdateCatalogs.
++      reused_count = reused_count + 1
++    else
++      local resource_path = GetPrefabResourcePath(prefab_controller)
++      local cached = cached_paths[weapon_id]
++      if cached and cached.src == resource_path and cached.kind == "ok" then
++        prefab_paths[weapon_id] = {mesh_path = cached.mesh, mat_path = cached.mat}
++        reused_count = reused_count + 1
++      elseif cached and cached.src == resource_path and cached.kind == "no_mesh" then
++        prefab_paths[weapon_id] = false
++        reused_count = reused_count + 1
++      elseif cached and cached.src == resource_path and (cached.failures or 0) >= WEAPON_CACHE_MAX_FAILURES then
++        prefab_paths[weapon_id] = false
++        reused_count = reused_count + 1
++      else
++        new_weapons[weapon_id], new_count = prefab_controller, new_count + 1
++      end
++    end
+   end
+   Transmogify.init_status = "Loading weapon prefabs"
+-  local loaded = LoadWeaponPrefabPaths(new_weapons)
++  local loaded, failed = LoadWeaponPrefabPaths(new_weapons)
++  failed = failed or {}
++  utils.Log(string.format("[%s] Weapon prefabs: %d prepared, %d served from the path cache", modname, new_count,
++    reused_count))
+   Transmogify.init_status = "Preparing weapon appearances"
+   Transmogify.init_weapon_current = 0
+   Transmogify.init_weapon_total = new_count
+@@ -4092,6 +4241,34 @@ local function AddWeapons()
+     end
+     prefab_paths[weapon_id] = loaded[weapon_id] or false
+   end
++
++  -- Persist what this launch learned: only new or changed prefabs get prepared on the next launch.
++  local saved_ok, saved_error = pcall(function()
++    local cache_entries = {}
++    for weapon_id, prefab_controller in pairs(catalog) do
++      local resource_path = GetPrefabResourcePath(prefab_controller)
++      local prepared = prefab_paths[weapon_id]
++      local previous = cached_paths[weapon_id]
++      local previous_failures = 0
++      if previous and previous.src == resource_path then previous_failures = previous.failures or 0 end
++      if failed[weapon_id] then
++        cache_entries[weapon_id] = {src = resource_path, kind = "failed", failures = previous_failures + 1}
++      elseif type(prepared) == "table" and prepared.mesh_path then
++        cache_entries[weapon_id] = {src = resource_path, kind = "ok", mesh = prepared.mesh_path, mat = prepared.mat_path}
++      elseif prepared == false then
++        cache_entries[weapon_id] = {src = resource_path, kind = "no_mesh"}
++      elseif previous and previous.src == resource_path then
++        cache_entries[weapon_id] = previous
++      end
++    end
++    SaveWeaponCache(cache_build, cache_entries)
++  end)
++  if not saved_ok then
++    utils.Log("[" .. modname .. "] Could not update the weapon path cache: " .. tostring(saved_error))
++  end
++
++  CATEGORY_ITEM_LIST[CAT_WEAPON] = CATEGORY_ITEM_LIST[CAT_WEAPON] or {}
++  CATEGORY_ITEM_LIST[CAT_SHIELD] = CATEGORY_ITEM_LIST[CAT_SHIELD] or {}
+   table.sort(CATEGORY_ITEM_LIST[CAT_WEAPON])
+   table.sort(CATEGORY_ITEM_LIST[CAT_SHIELD])
+ end
+@@ -8132,19 +8309,41 @@ do
+   local function RunHostUpdate(update)
+     local success, reason = pcall(update)
+     if success then return end
++    utils.Log("[Transmogify] host update error: " .. tostring(reason))
+     failure = failure and failure .. "\n" .. tostring(reason) or tostring(reason)
+   end
+ 
+   -- REFramework callbacks run outside any engine managed frame, so a native call that enters and leaves managed code
+   -- there can run this thread's temporary-object cleanup mid-call. The engine dispatches this callback on the main
+   -- thread inside a managed frame, once per frame in every observed game state, after the late behavior update.
++  Transmogify.frame_host_alive = false
+   utils.HookFrameHost(function()
++    if not Transmogify.frame_host_alive then
++      Transmogify.frame_host_alive = true
++      utils.Log("[Transmogify] frame host callback is running")
++    end
+     failure = nil
+     RunHostUpdate(Transmogify.UpdateReconciliation)
+     if Transmogify_Warfarer and Transmogify_Warfarer.Tick then RunHostUpdate(Transmogify_Warfarer.Tick) end
+     RunHostUpdate(Transmogify.UpdateStartup)
+     if failure then error(failure, 0) end
+   end)
++
++  -- Fallback: the native frame host hook can fail to install on a game build newer than this script. In that case the
++  -- whole per-frame update loop never runs and the mod sits on its initial status forever. Drive the startup work from
++  -- a REFramework application entry instead, which is dispatched on the main thread inside a managed frame.
++  local fallback_reported = false
++  re.on_application_entry("UpdateBehavior", function()
++    if Transmogify.frame_host_alive then return end
++    if not fallback_reported then
++      fallback_reported = true
++      utils.Log("[Transmogify] frame host hook is not firing; driving startup from UpdateBehavior instead")
++    end
++    local ok, reason = pcall(Transmogify.UpdateStartup)
++    if not ok then
++      utils.Log("[Transmogify] fallback UpdateStartup failed: " .. tostring(reason))
++    end
++  end)
+ end
+ 
+ do
+@@ -9005,3 +9204,4 @@ sdk.hook(
+ )
+ 
+ utils.Log("[" .. modname .. "] " .. version .. " script loaded")
++
+diff --git a/vanilla/utils.lua b/reframework/autorun/_TransmogifyUtils/utils.lua
+index 64e5041..2e8fb0d 100644
+--- a/vanilla/utils.lua
++++ b/reframework/autorun/_TransmogifyUtils/utils.lua
+@@ -6,6 +6,8 @@ local function Log(...)
+     message = message .. tostring(select(i, ...))
+   end
+   log.info(message)
++  -- log.info is silent in the current REFramework build; print() still reaches re2_framework_log.txt.
++  print(message)
+ end
+ 
+ local function LogD(...)
+@@ -995,9 +997,13 @@ do
+   -- the frame host once per update until it returns true; Cleanup ends the loads in progress.
+   function utils.NewPrefabLoader(entries, limit, on_ready)
+     return setmetatable({entries = entries, limit = limit, on_ready = on_ready, queued = 1, in_flight = 0, done = 0,
+-      active = {}}, PrefabLoader)
++      active = {}, failed = {}}, PrefabLoader)
+   end
+ 
++  -- A prefab whose material never becomes ready used to stall the whole build forever: give up on it after this long
++  -- and remember its WeaponID so the caller can retry or skip it.
++  local PREFAB_ENTRY_TIMEOUT_SECONDS = 20
++
+   function PrefabLoader:Step()
+     while self.in_flight < self.limit and self.queued <= #self.entries do
+       local entry = self.entries[self.queued]
+@@ -1008,21 +1014,39 @@ do
+       self.in_flight = self.in_flight + 1
+     end
+     for entry in pairs(self.active) do
+-      if not entry.object and entry.controller:get_Ready() then
+-        local position = ValueType.new(position_type)
+-        position.x, position.y, position.z = 0, 0, 0
+-        entry.object = entry.controller:get_Item():call("instantiate(via.Position)", position)
+-        if not entry.object then error("Weapon prefab instantiation failed: " .. tostring(entry.controller:get_ResourcePath())) end
+-        local weapon = utils.GetObjectComponent(entry.object, "app.Weapon")
+-        entry.mesh = weapon and weapon.Mesh or false
+-      end
+-      local mesh = entry.mesh
+-      if mesh == false or (mesh and mesh:get_MeshReady() and mesh:get_MaterialReady()) then
+-        self.on_ready(entry, mesh or nil)
+-        FinishLoad(entry)
++      if entry.started and (utils.Seconds() - entry.started) > PREFAB_ENTRY_TIMEOUT_SECONDS then
++        local mesh = entry.mesh
++        local readiness = "prefab-not-ready"
++        if mesh == false then
++          readiness = "no-weapon-mesh"
++        elseif mesh then
++          readiness = string.format("mesh=%s material=%s", tostring(mesh:get_MeshReady()),
++            tostring(mesh:get_MaterialReady()))
++        end
++        Log(string.format("[Transmogify] Giving up on weapon prefab after %.0f s: %s (WeaponID %s) [%s]",
++          utils.Seconds() - entry.started, tostring(entry.path), tostring(entry.weapon_id), readiness))
++        self.failed[entry.weapon_id] = true
++        pcall(FinishLoad, entry)
+         self.active[entry] = nil
+         self.in_flight = self.in_flight - 1
+         self.done = self.done + 1
++      else
++        if not entry.object and entry.controller:get_Ready() then
++          local position = ValueType.new(position_type)
++          position.x, position.y, position.z = 0, 0, 0
++          entry.object = entry.controller:get_Item():call("instantiate(via.Position)", position)
++          if not entry.object then error("Weapon prefab instantiation failed: " .. tostring(entry.controller:get_ResourcePath())) end
++          local weapon = utils.GetObjectComponent(entry.object, "app.Weapon")
++          entry.mesh = weapon and weapon.Mesh or false
++        end
++        local mesh = entry.mesh
++        if mesh == false or (mesh and mesh:get_MeshReady() and mesh:get_MaterialReady()) then
++          self.on_ready(entry, mesh or nil)
++          FinishLoad(entry)
++          self.active[entry] = nil
++          self.in_flight = self.in_flight - 1
++          self.done = self.done + 1
++        end
+       end
+     end
+     return self.done == #self.entries
